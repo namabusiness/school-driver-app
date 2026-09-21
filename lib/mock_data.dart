@@ -1,4 +1,12 @@
 class DriverProfile {
+  const DriverProfile.empty()
+    : name = '',
+      id = '',
+      busNumber = '',
+      busName = '',
+      routeName = '',
+      stops = const [];
+
   const DriverProfile({
     required this.name,
     required this.id,

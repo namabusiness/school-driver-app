@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'app_controller.dart';
 import 'app_theme.dart';
+import 'location/location_tracking_service.dart';
 import 'mock_data.dart';
 import 'widgets.dart';
 
@@ -13,7 +14,9 @@ class AppNavigator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => controller.isAuthenticated
-      ? DashboardScreen(controller: controller)
+      ? controller.tripStatus == TripStatus.inProgress
+            ? ActiveTripScreen(controller: controller)
+            : DashboardScreen(controller: controller)
       : SplashScreen(controller: controller);
 }
 
@@ -29,16 +32,25 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    Timer(const Duration(milliseconds: 800), () {
-      if (mounted && !widget.controller.isAuthenticated) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (_) => LoginScreen(controller: widget.controller),
-          ),
-        );
-      }
-    });
+    widget.controller.addListener(_navigateWhenReady);
+    Timer(const Duration(milliseconds: 800), _navigateWhenReady);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_navigateWhenReady);
+    super.dispose();
+  }
+
+  void _navigateWhenReady() {
+    if (!mounted || widget.controller.isRestoringSession) return;
+    if (widget.controller.isAuthenticated) return;
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => LoginScreen(controller: widget.controller),
+      ),
+    );
   }
 
   @override
@@ -124,12 +136,28 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
     setState(() => error = null);
-    await widget.controller.login();
+    final didLogin = await widget.controller.login(
+      emailController.text.trim(),
+      passwordController.text,
+    );
+    if (!didLogin) {
+      if (mounted) setState(() => error = widget.controller.authError);
+      return;
+    }
+    if (!widget.controller.isAuthenticated) {
+      if (mounted) setState(() => error = widget.controller.driverDataError);
+      return;
+    }
     if (mounted) {
       Navigator.pushAndRemoveUntil(
         context,
         MaterialPageRoute(
-          builder: (_) => DashboardScreen(controller: widget.controller),
+          builder: (_) {
+            if (widget.controller.tripStatus == TripStatus.inProgress) {
+              return ActiveTripScreen(controller: widget.controller);
+            }
+            return DashboardScreen(controller: widget.controller);
+          },
         ),
         (_) => false,
       );
@@ -259,6 +287,15 @@ class DashboardScreen extends StatelessWidget {
               ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
             ),
             const SizedBox(height: 24),
+            if (controller.isLoadingDriverData)
+              const Center(child: CircularProgressIndicator()),
+            if (controller.driverDataError != null)
+              AppCard(
+                child: Text(
+                  controller.driverDataError!,
+                  style: const TextStyle(color: Colors.red),
+                ),
+              ),
             const SectionHeader('Today\'s assignment'),
             const SizedBox(height: 10),
             BusCard(driver: driver, onTap: () => _openRoute(context)),
@@ -315,9 +352,11 @@ class DashboardScreen extends StatelessWidget {
             const SizedBox(height: 24),
             if (controller.tripStatus == TripStatus.assigned)
               PrimaryActionButton(
-                label: 'START TRIP',
+                label: controller.isStartingTrip ? 'STARTING...' : 'START TRIP',
                 icon: Icons.play_arrow_rounded,
-                onPressed: () => _confirmStart(context),
+                onPressed: controller.isStartingTrip
+                    ? null
+                    : () => _confirmStart(context),
               ),
             if (controller.tripStatus == TripStatus.completed)
               AppCard(
@@ -369,8 +408,8 @@ class DashboardScreen extends StatelessWidget {
       icon: Icons.play_circle_outline_rounded,
     );
     if (confirmed == true && context.mounted) {
-      await controller.startTrip();
-      if (context.mounted) {
+      final started = await controller.startTrip();
+      if (started && context.mounted) {
         Navigator.push(
           context,
           MaterialPageRoute(
@@ -495,7 +534,7 @@ class ActiveTripScreen extends StatelessWidget {
               const SizedBox(height: 16),
               const MapPlaceholder(),
               const SizedBox(height: 20),
-              const AppCard(
+              AppCard(
                 child: Column(
                   children: [
                     Row(
@@ -503,13 +542,15 @@ class ActiveTripScreen extends StatelessWidget {
                         Expanded(
                           child: Metric(
                             label: 'Trip started',
-                            value: '07:02 AM',
+                            value: _formatTime(
+                              controller.currentTrip?.startedAt,
+                            ),
                           ),
                         ),
                         Expanded(
                           child: Metric(
                             label: 'Tracking status',
-                            value: 'Active',
+                            value: _trackingLabel(controller),
                           ),
                         ),
                       ],
@@ -520,7 +561,9 @@ class ActiveTripScreen extends StatelessWidget {
                         Expanded(
                           child: Metric(
                             label: 'Last update',
-                            value: 'Just now',
+                            value: controller.lastLocationSentAt == null
+                                ? 'Waiting'
+                                : 'Just now',
                           ),
                         ),
                         Expanded(
@@ -544,7 +587,9 @@ class ActiveTripScreen extends StatelessWidget {
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFFB23B3B),
                 ),
-                onPressed: () => _confirmEnd(context),
+                onPressed: controller.isEndingTrip
+                    ? null
+                    : () => _confirmEnd(context),
                 icon: const Icon(Icons.stop_circle_outlined),
                 label: const Text('END TRIP'),
               ),
@@ -553,6 +598,25 @@ class ActiveTripScreen extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  String _trackingLabel(AppController controller) {
+    if (controller.isTracking) return 'Active';
+    return switch (controller.trackingStatus) {
+      TrackingStatus.permissionRequired => 'Permission needed',
+      TrackingStatus.unavailable => 'Location unavailable',
+      TrackingStatus.error => 'Retrying',
+      _ => 'Starting',
+    };
+  }
+
+  String _formatTime(DateTime? value) {
+    if (value == null) return 'Starting';
+    final hour = value.toLocal().hour;
+    final minute = value.toLocal().minute.toString().padLeft(2, '0');
+    final suffix = hour >= 12 ? 'PM' : 'AM';
+    final displayHour = hour % 12 == 0 ? 12 : hour % 12;
+    return '$displayHour:$minute $suffix';
   }
 
   Future<void> _confirmEnd(BuildContext context) async {
@@ -564,8 +628,8 @@ class ActiveTripScreen extends StatelessWidget {
       icon: Icons.stop_circle_outlined,
     );
     if (confirmed == true && context.mounted) {
-      await controller.endTrip();
-      if (context.mounted) {
+      final ended = await controller.endTrip();
+      if (ended && context.mounted) {
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
@@ -870,7 +934,8 @@ class ProfileScreen extends StatelessWidget {
       icon: Icons.logout_rounded,
     );
     if (confirmed == true && context.mounted) {
-      controller.logout();
+      await controller.logout();
+      if (!context.mounted || controller.isAuthenticated) return;
       Navigator.pushAndRemoveUntil(
         context,
         MaterialPageRoute(builder: (_) => LoginScreen(controller: controller)),
